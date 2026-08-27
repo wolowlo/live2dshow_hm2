@@ -1,5 +1,6 @@
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { util } from '@kit.ArkTS';
 import zlib from '@ohos.zlib';
 import resourceManager from '@ohos.resourceManager';
 import { parseJsonLenient } from './JsonUtil';
@@ -34,32 +35,123 @@ export interface ImportResult {
  * 模型目录保持解压相对结构，扫描器按原项目规则（rglob）识别入口。
  */
 export class ImportService {
-  /** 导入内置示例模型（rawfile → 沙箱 → 扫描）：用于首次体验与双来源验证 */
+  /** 导入内置示例模型（rawfile → 沙箱 → 扫描）：遍历 rawfile/models 下任意目录，不限于固定路径 */
   async importSamples(context: common.UIAbilityContext, category: string = ''): Promise<ImportResult> {
     const resMgr = context.resourceManager;
     const modelsRoot = `${context.filesDir}/models`;
     const beforeKeys = await this.collectEntryKeys();
-    // Cubism 3 示例（内置 z46_4）
-    await this.copyRawDirToSandbox(
-      resMgr,
-      'models/cubism3/Azue Lane/z46_4',
-      `${modelsRoot}/cubism3/Azue Lane/z46_4`,
-    );
-    // Cubism 2 示例：遍历 SacredSwordprincesses 组下全部角色（含 025 与新增测试模型）
-    const sacredGroup = 'models/cubism2/model/SacredSwordprincesses';
-    const sacredItems = resMgr.getRawFileListSync(sacredGroup);
-    for (const item of sacredItems) {
-      await this.copyRawDirToSandbox(
-        resMgr,
-        `${sacredGroup}/${item}`,
-        `${modelsRoot}/cubism2/model/SacredSwordprincesses/${item}`,
-      );
+    let moved = 0;
+    // Cubism 3：递归扫描任意深度 *.model3.json，按 组/角色 两级落位（自动跳过 live2d/model 等通用容器层）
+    for (const c3Entry of this.listRawFiles(resMgr, 'models/cubism3', '.model3.json')) {
+      const roleDir = this.rawParentDir(c3Entry);
+      const rel = roleDir.substring('models/cubism3/'.length);
+      const relParts = rel.split('/');
+      const group = relParts.length > 1 ? relParts[0] : '未分组';
+      const role = this.c3RoleName(relParts);
+      const dest = `${modelsRoot}/cubism3/${group}/${role}`;
+      const copied = await this.copyRawDirToSandbox(resMgr, roleDir, dest);
+      if (copied) {
+        moved++;
+      }
+    }
+    // Cubism 2：遍历任意目录，找到含 model: xxx.moc 入口 json 的模型目录，保持相对结构复制
+    const c2Root = 'models/cubism2';
+    for (const dir of this.listRawDirs(resMgr, c2Root)) {
+      if (await this.isCubism2RawDir(resMgr, dir)) {
+        const rel = dir.substring(c2Root.length + 1);
+        const dest = `${modelsRoot}/cubism2/${rel}`;
+        const copied = await this.copyRawDirToSandbox(resMgr, dir, dest);
+        if (copied) {
+          moved++;
+        }
+      }
     }
     const scan = await modelScanner.scanAndPersist();
-    const models = await modelStore.listModels();
     await this.applyCategoryToNewModels(beforeKeys, category);
-    Logger.info(TAG, '内置示例导入完成: 新增 %{public}d 条', scan.added);
-    return { movedItems: 1 + sacredItems.length, added: scan.added, version: 'mixed' };
+    Logger.info(TAG, '内置示例导入完成: 复制 %{public}d 个模型目录，新增 %{public}d 条', moved, scan.added);
+    return { movedItems: moved, added: scan.added, version: 'mixed' };
+  }
+
+  /** 递归列出 rawfile 目录下全部文件路径（getRawFileListSync 对目录抛异常，按此区分文件/目录） */
+  private listRawFiles(resMgr: resourceManager.ResourceManager, rawDir: string, suffix: string): string[] {
+    const out: string[] = [];
+    let items: string[] = [];
+    try {
+      items = resMgr.getRawFileListSync(rawDir);
+    } catch (e) {
+      return out;
+    }
+    for (const item of items) {
+      const full = `${rawDir}/${item}`;
+      if (item.endsWith(suffix)) {
+        out.push(full);
+      }
+      out.push(...this.listRawFiles(resMgr, full, suffix));
+    }
+    return out;
+  }
+
+  /** 递归列出 rawfile 目录下全部目录路径（不含根自身） */
+  private listRawDirs(resMgr: resourceManager.ResourceManager, rawDir: string): string[] {
+    const out: string[] = [];
+    let items: string[] = [];
+    try {
+      items = resMgr.getRawFileListSync(rawDir);
+    } catch (e) {
+      return out;
+    }
+    for (const item of items) {
+      const full = `${rawDir}/${item}`;
+      if (!this.isRawDir(resMgr, full)) {
+        continue;
+      }
+      out.push(full);
+      out.push(...this.listRawDirs(resMgr, full));
+    }
+    return out;
+  }
+
+  /** rawfile 路径是否为目录：getRawFileListSync 能列出子项即目录 */
+  private isRawDir(resMgr: resourceManager.ResourceManager, path: string): boolean {
+    try {
+      resMgr.getRawFileListSync(path);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** rawfile 目录是否含 Cubism 2 入口：目录内存在 model 字段以 .moc 结尾的 json */
+  private async isCubism2RawDir(resMgr: resourceManager.ResourceManager, dir: string): Promise<boolean> {
+    let items: string[] = [];
+    try {
+      items = resMgr.getRawFileListSync(dir);
+    } catch (e) {
+      return false;
+    }
+    for (const item of items) {
+      if (!item.endsWith('.json')) {
+        continue;
+      }
+      try {
+        const bytes = resMgr.getRawFileContentSync(`${dir}/${item}`);
+        const text = new util.TextDecoder('utf-8').decodeToString(bytes);
+        const data = parseJsonLenient(text) as Record<string, Object> | null;
+        const model = data ? data['model'] as string : undefined;
+        if (typeof model === 'string' && model.endsWith('.moc')) {
+          return true;
+        }
+      } catch (e) {
+        // 读取/解析失败跳过
+      }
+    }
+    return false;
+  }
+
+  /** 取 rawfile 路径的父目录 */
+  private rawParentDir(path: string): string {
+    const idx = path.lastIndexOf('/');
+    return idx > 0 ? path.substring(0, idx) : '';
   }
 
   async importFromZip(context: common.UIAbilityContext, zipUri: string, category: string = '',
@@ -126,13 +218,14 @@ export class ImportService {
     }
   }
 
-  /** 递归复制 rawfile 目录到沙箱（getRawFileListSync 列目录，内容读取失败视为子目录） */
+  /** 递归复制 rawfile 目录到沙箱（返回是否实际复制了新内容；目标已存在则跳过，保持幂等） */
   private async copyRawDirToSandbox(resMgr: resourceManager.ResourceManager, rawDir: string,
-    destDir: string): Promise<void> {
+    destDir: string): Promise<boolean> {
     // API 24 上 fs.mkdir(path, true) 对已存在目录抛 EEXIST(13900015)，先判断再创建保证幂等
     if (!fs.accessSync(destDir)) {
       await fs.mkdir(destDir, true);
     }
+    let copied = false;
     const items = resMgr.getRawFileListSync(rawDir);
     for (const item of items) {
       const rawPath = `${rawDir}/${item}`;
@@ -141,15 +234,19 @@ export class ImportService {
       if (fs.accessSync(destPath)) {
         continue;
       }
-      try {
+      if (this.isRawDir(resMgr, rawPath)) {
+        if (await this.copyRawDirToSandbox(resMgr, rawPath, destPath)) {
+          copied = true;
+        }
+      } else {
         const data = resMgr.getRawFileContentSync(rawPath);
         const file = fs.openSync(destPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
         fs.writeSync(file.fd, data.buffer);
         fs.closeSync(file);
-      } catch (e) {
-        await this.copyRawDirToSandbox(resMgr, rawPath, destPath);
+        copied = true;
       }
     }
+    return copied;
   }
 
   /** 识别解压内容属于哪个模型版本（优先 Cubism 3） */

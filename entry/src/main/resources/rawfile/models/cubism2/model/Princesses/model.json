@@ -1,0 +1,7 @@
+{
+  "model": "model.moc",
+  "textures": [
+    "textures/texture_00 .png",
+    "textures/texture_01 .png"
+  ]
+}
