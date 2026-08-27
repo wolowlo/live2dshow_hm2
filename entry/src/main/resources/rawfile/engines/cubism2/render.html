@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Live2D Cubism2 Render</title>
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: transparent; }
+  /* 禁用 WebView 默认点击高亮（canvas 可点击时 Chromium 会渲染蓝色覆盖层） */
+  * { -webkit-tap-highlight-color: transparent; }
+  #wrap { position: relative; width: 100%; height: 100%; }
+  canvas#l2d-render-canvas {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    /* 等比缩放并居中：画布占满舞台，object-fit 负责完整显示，减少底部留白 */
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+  .msg {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #9ca3af;
+    font-size: 12px;
+    font-family: system-ui, -apple-system, sans-serif;
+    text-align: center;
+    padding: 0 6px;
+    box-sizing: border-box;
+  }
+  .msg.err { color: #ef4444; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="l2d-render-canvas" width="300" height="800"></canvas>
+    <div id="msg" class="msg" style="display: none;"></div>
+  </div>
+
+  <script>
+  // 单模型渲染页：?path=model/<dir>/<entry>.json&cw=&ch=&fps=&actions=（相对 live2d_2 根）
+  // 每个实例独立加载一份 live2d.js；cw/ch 为模型 .moc canvas 尺寸（画布按模型比例设置），
+  // 显示层由 CSS object-fit: contain 等比缩放居中。
+  // 舞台/看板娘传 fps=30（卡片默认 15）；actions 为逗号分隔的动作名列表，
+  // 注入 idle 组后每 3 秒强制轮播（PRIORITY_FORCE=4，与原项目一致）。
+  ;(function () {
+    var params = new URLSearchParams(location.search)
+    var path = params.get('path')
+    var canvas = document.getElementById('l2d-render-canvas')
+    var msg = document.getElementById('msg')
+    var fpsParam = parseInt(params.get('fps'), 10)
+    var CARD_FPS = fpsParam > 0 ? fpsParam : 15
+    // 动作列表：逗号分隔的相对路径（如 motions/happy.mtn 或 MarcyMtn_000.mtn）
+    var ACTION_NAMES = (params.get('actions') || '').split(',').map(function (s) { return s.trim() }).filter(function (s) { return s !== '' })
+    // 输入校验：仅允许 model/ 开头的相对路径，拒绝 .. 段（后端 assets 路由另有穿越防护，这里双保险）
+    if (!path || path.indexOf('..') !== -1 || path.indexOf('model/') !== 0) {
+      notifyFail('非法的 path 参数')
+      return
+    }
+
+    // 画布内部尺寸：卡片显示区很小（约 150-230px 高），按“显示尺寸×DPR(≤2)”
+    // 计算内部分辨率，替代固定 800px 高基准——内部绘制面积最多可降十几倍，
+    // 直接削减 GPU fill rate（移动端发烫/掉电的主要来源之一）。
+    // hi=1（模型页舞台）：DPR 上限放宽到 4，双指放大后仍保持物理像素级清晰；
+    // 卡片缩略图不传 hi，维持低分辨率省电。
+    var cw = parseInt(params.get('cw'), 10)
+    var ch = parseInt(params.get('ch'), 10)
+    var limitDpr = params.get('hi') === '1' ? 4 : 2
+    var dpr = Math.min(window.devicePixelRatio || 1, limitDpr)
+
+    function sizeCanvas() {
+      var wrap = document.getElementById('wrap')
+      var dispW = Math.max(wrap.clientWidth || 300, 60)
+      var dispH = Math.max(wrap.clientHeight || 400, 80)
+      var modelW = cw > 0 && ch > 0 ? cw : 300
+      var modelH = cw > 0 && ch > 0 ? ch : 800
+      // contain：内部画布 = 模型比例下适配显示区域（×DPR）的内容尺寸
+      var s = Math.min((dispW * dpr) / modelW, (dispH * dpr) / modelH)
+      canvas.width = Math.max(60, Math.round(modelW * s))
+      canvas.height = Math.max(80, Math.round(modelH * s))
+    }
+    sizeCanvas()
+    // 旋转屏幕后显示区域与画布比例不再匹配，重建页面重新加载（资源走 HTTP 缓存，成本低）
+    window.addEventListener('orientationchange', function () { location.reload() })
+
+    // live2d.js 的渲染循环在引擎内部、无法直接限帧，这里在引擎加载前包装
+    // requestAnimationFrame：把回调频率压到 CARD_FPS（15fps）。
+    // 丢弃中间帧即可——回调的时间戳是真实时间，引擎按真实时间推进动画，不会变速。
+    // 注意：引擎的循环是“回调内部重新排队”，丢弃帧时也必须继续观察下一帧，
+    // 否则 rAF 链中断、模型永远不渲染。
+    var rafInterval = 1000 / CARD_FPS
+    var nativeRaf = window.requestAnimationFrame.bind(window)
+    var lastRafTs = 0
+    var rafQueued = false
+    window.requestAnimationFrame = function (cb) {
+      function throttled(ts) {
+        rafQueued = false
+        // 首帧无条件执行，避免页面刚加载（ts 很小）时卡住首屏
+        if (lastRafTs === 0 || ts - lastRafTs >= rafInterval) {
+          lastRafTs = ts
+          cb(ts)
+          // 引擎回调内部会再次调用 requestAnimationFrame（包装后的），此时
+          // rafQueued 已置 false，会正常重新排队——任意时刻只有一条等待链
+        } else {
+          // 丢弃中间帧：手动重新排队观察下一帧，保证 rAF 链不断
+          window.requestAnimationFrame(cb)
+        }
+      }
+      nativeRaf(throttled)
+      // 引擎不使用 cancelAnimationFrame 取消循环帧；如遇异常需移除本段节流
+      return 0
+    }
+
+    // 引擎加载后隐藏 loading 文案（引擎异步回调无法可靠捕获失败）
+    function hideMsg() { msg.style.display = 'none' }
+    // 加载失败统一通知宿主：标题置为 l2d-fail，缩略图队列立即跳过（不等兜底超时）
+    function notifyFail(text) {
+      msg.textContent = text
+      msg.classList.add('err')
+      document.title = 'l2d-fail'
+    }
+
+    // ── 动作轮播（C2 每 3 秒强制播放一个动作）──
+    var ACTION_INTERVAL_MS = 3000
+    var PRIORITY_FORCE = 4
+    var rotateTimer = null
+    var rotateIndex = 0
+    var idleBaseCount = 0
+    // 动作是否已注入 idle 组（宿主动作面板手动播放依赖；换模型/换动作列表时重置）
+    var actionsInjected = false
+    // 双缓冲就绪轮询句柄：连续切换时先清掉上一次，避免并发轮询导致模型管理器累积
+    var switchTimer = null
+    // 立绘比例画布：模型加载后按自身包围盒调整画布比例，减少竖舞台中的上下留白
+    var focusScheduled = false
+    var focusDone = false
+
+    /** 遍历 draw data 的变换后顶点，求立绘包围盒（模型坐标） */
+    function computeModelBounds() {
+      var mgr = window.__live2dManager
+      var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+      var lm = model && model.live2DModel
+      if (!lm || !lm.getDrawDataList || !lm.getTransformedPoints) return null
+      var list = lm.getDrawDataList()
+      var minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+      for (var i = 0; i < list.length; i++) {
+        var pts = lm.getTransformedPoints(i)
+        if (!pts) continue
+        for (var j = 0; j < pts.length; j += 2) {
+          var x = pts[j], y = pts[j + 1]
+          if (x < minX) minX = x
+          if (x > maxX) maxX = x
+          if (y < minY) minY = y
+          if (y > maxY) maxY = y
+        }
+      }
+      if (minX > maxX || minY > maxY) return null
+      return { w: maxX - minX, h: maxY - minY }
+    }
+
+    /** 清空模型管理器中的全部旧模型（引擎渲染循环会绘制所有 models，残留会叠加） */
+    function releaseAllModels(mgr) {
+      if (!mgr) return
+      var models = mgr.models || []
+      for (var i = models.length - 1; i >= 0; i--) {
+        var m = models[i]
+        if (m && m.release) {
+          try { m.release(true) } catch (e) { /* 释放失败不阻塞切换 */ }
+        }
+      }
+      models.splice(0, models.length)
+    }
+
+    /** 首次加载后：把画布内部比例调整为立绘比例，并用 loadlive2d 重载一次让视口生效 */
+    function applyFocus() {
+      // 真机兼容性：部分设备首次二次加载（loadlive2d 重载）后画面空白。
+      // 暂时禁用聚焦重载，保证首次加载稳定；立绘比例适配后续再优化。
+      focusDone = true
+      return
+      if (focusDone) return
+      var mgr = window.__live2dManager
+      var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+      if (!model) return
+      var box = computeModelBounds()
+      if (!box || box.w <= 0 || box.h <= 0) return
+      if (!focusScheduled) {
+        focusScheduled = true
+        // 目标：画布宽高比 = 立绘宽高比（内部尺寸任意缩放不影响 contain 后的显示大小）
+        var w = canvas.width
+        var h = Math.round(w * box.h / box.w)
+        var MAX_INNER = 1600
+        if (h > MAX_INNER) {
+          var k = MAX_INNER / h
+          w = Math.round(w * k)
+          h = MAX_INNER
+        }
+        if (Math.abs(h - canvas.height) / canvas.height > 0.05) {
+          var oldW = canvas.width
+          var oldH = canvas.height
+          canvas.width = w
+          canvas.height = h
+          // 仅聚焦时重载一次（loadlive2d 会重建视口矩阵）；先清空旧模型避免叠加
+          releaseAllModels(mgr)
+          loadlive2d('l2d-render-canvas', '/api/live2d/assets/cubism2/' + path)
+          // 聚焦重载失败回退：一段时间后新模型仍未就绪，恢复原画布重新加载（保证可见）
+          setTimeout(function () {
+            var m = mgr.getModel(0)
+            if (!m || !m.isInitialized || !m.isInitialized()) {
+              canvas.width = oldW
+              canvas.height = oldH
+              releaseAllModels(mgr)
+              loadlive2d('l2d-render-canvas', '/api/live2d/assets/cubism2/' + path)
+              startRotation()
+              setTimeout(hideMsg, 1500)
+            }
+          }, 4000)
+          startRotation()
+          setTimeout(hideMsg, 1500)
+          return
+        }
+      }
+      focusDone = true
+    }
+
+    /** 把扫描到的动作注入 idle 组（幂等；宿主动作面板手动播放前也调用） */
+    function injectActions() {
+      if (actionsInjected) return true
+      var mgr = window.__live2dManager
+      var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+      if (!model || !model.isInitialized || !model.isInitialized()) return false
+      var setting = model.modelSetting
+      if (!setting || !setting.json) return false
+      if (ACTION_NAMES.length === 0) return true
+      var motions = setting.json['motions'] || (setting.json['motions'] = {})
+      var idle = motions['idle'] || (motions['idle'] = [])
+      idleBaseCount = idle.length
+      // 字段名与引擎 modelSetting 读取保持一致：file / fade_in / fade_out；
+      // File 为相对模型目录路径，引擎按 modelHomeDir 拼接加载
+      ACTION_NAMES.forEach(function (name) {
+        idle.push({ 'file': name, 'fade_in': 500, 'fade_out': 500 })
+      })
+      actionsInjected = true
+      return true
+    }
+
+    /** 等模型初始化后：把扫描到的动作注入 idle 组，然后开始轮播 */
+    function startRotation() {
+      stopRotation()
+      var waited = 0
+      var waitTimer = setInterval(function () {
+        var mgr = window.__live2dManager
+        var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+        if (!model || !model.isInitialized || !model.isInitialized()) {
+          waited += 250
+          if (waited > 15000) {
+            clearInterval(waitTimer)
+            notifyFail('模型加载超时')
+          }
+          return
+        }
+        clearInterval(waitTimer)
+        // 通知宿主（缩略图截图/轮换缓存）：模型已就绪（动作列表为空也要通知，
+        // 否则宿主等满兜底超时才会跳过，无动作模型被误标失败）
+        document.title = 'l2d-ready'
+        // 立绘比例画布（首次调整后自动进入动作轮播）
+        applyFocus()
+        if (ACTION_NAMES.length === 0 || !injectActions()) return
+        playNextAction()
+        rotateTimer = setInterval(playNextAction, ACTION_INTERVAL_MS)
+      }, 250)
+    }
+
+    function stopRotation() {
+      if (rotateTimer !== null) {
+        clearInterval(rotateTimer)
+        rotateTimer = null
+      }
+    }
+
+    function playNextAction() {
+      var mgr = window.__live2dManager
+      var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+      if (!model || ACTION_NAMES.length === 0) return
+      try {
+        model.startMotion('idle', idleBaseCount + (rotateIndex % ACTION_NAMES.length), PRIORITY_FORCE)
+        console.log('[L2D2] rotateAction: ' + ACTION_NAMES[rotateIndex % ACTION_NAMES.length])
+        rotateIndex += 1
+      } catch (e) {
+        // 模型未就绪等场景静默跳过，下一轮再试
+      }
+    }
+
+    /** 缩略图导出：把渲染画布等比缩小后转 PNG dataURL（preserveDrawingBuffer 已开启） */
+    window.__thumbDataUrl = function () {
+      try {
+        var w = 240
+        var h = Math.max(1, Math.round(canvas.height * 240 / canvas.width))
+        var off = document.createElement('canvas')
+        off.width = w
+        off.height = h
+        var ctx = off.getContext('2d')
+        ctx.drawImage(canvas, 0, 0, w, h)
+        return off.toDataURL('image/png')
+      } catch (e) {
+        return ''
+      }
+    }
+
+    // 宿主先调 __setStageBg 注入背景规格并预加载图片背景，再调 __stageShot(scale, rx, ry, stageW, stageH) 合成导出。
+    // scale=宿主视角缩放（以画布中心为锚）；rx/ry=视角位移相对舞台宽高的比例（背景不参与变换）。
+    // stageW/stageH=宿主舞台逻辑尺寸(vp)：输出画布按「舞台纵横比 × max(dpr,2)」生成，
+    // 保证背景 cover 裁切与 ArkUI 层 Image.Cover 完全一致，且输出达到屏幕物理像素级清晰度。
+    // 本引擎画布为「立绘比例」，模型绘制时按 object-fit: contain 适配输出画布（与屏幕显示一致）。
+    var __stageBgSpec = { type: 'color', color: '' }
+    var __stageBgImg = null
+    var __stageBgImgUrl = ''
+    window.__setStageBg = function (specJson) {
+      try {
+        var spec = JSON.parse(specJson || '')
+        if (!spec || typeof spec !== 'object') return
+        __stageBgSpec = spec
+        if (spec.type === 'image' && spec.url && spec.url !== __stageBgImgUrl) {
+          __stageBgImgUrl = spec.url
+          __stageBgImg = null
+          var img = new Image()
+          img.onload = function () { __stageBgImg = img }
+          img.onerror = function () { __stageBgImg = null }
+          img.src = spec.url
+        }
+      } catch (e) { /* 非法背景规格忽略 */ }
+    }
+    window.__stageShot = function (scale, rx, ry, stageW, stageH) {
+      try {
+        var src = canvas
+        // 输出画布：舞台纵横比 × 物理倍率（≥2），兜底用模型画布尺寸
+        var dprOut = Math.max(window.devicePixelRatio || 1, 2)
+        var outW = (stageW > 0) ? Math.round(stageW * dprOut) : src.width
+        var outH = (stageH > 0) ? Math.round(stageH * dprOut) : src.height
+        var MAX_EDGE = 2560
+        if (outW > MAX_EDGE || outH > MAX_EDGE) {
+          var k = MAX_EDGE / Math.max(outW, outH)
+          outW = Math.round(outW * k)
+          outH = Math.round(outH * k)
+        }
+        var off = document.createElement('canvas')
+        off.width = outW
+        off.height = outH
+        var ctx = off.getContext('2d')
+        ctx.imageSmoothingEnabled = true
+        ctx.imageSmoothingQuality = 'high'
+        var spec = __stageBgSpec || {}
+        if (spec.type === 'image' && __stageBgImg && __stageBgImg.width > 0) {
+          // 图片背景：cover 铺满输出画布（基于舞台纵横比，与 ArkUI Image.Cover 裁切一致）
+          var iw = __stageBgImg.width
+          var ih = __stageBgImg.height
+          var cw = off.width
+          var ch = off.height
+          var cover = Math.max(cw / iw, ch / ih)
+          var dw = iw * cover
+          var dh = ih * cover
+          ctx.drawImage(__stageBgImg, (cw - dw) / 2, (ch - dh) / 2, dw, dh)
+        } else if (spec.type === 'color' && spec.color) {
+          ctx.fillStyle = spec.color
+          ctx.fillRect(0, 0, off.width, off.height)
+        }
+        // 模型画布（透明底）：先 contain 适配输出画布（与 CSS object-fit: contain 显示一致，
+        // 等比居中），再叠加宿主视角变换（scale 以中心为锚 + 平移，背景不参与）
+        var cs = Math.min(outW / src.width, outH / src.height)
+        var mw = src.width * cs
+        var mh = src.height * cs
+        var s = (typeof scale === 'number' && isFinite(scale)) ? scale : 1
+        var tx = (typeof rx === 'number' && isFinite(rx)) ? rx * outW : 0
+        var ty = (typeof ry === 'number' && isFinite(ry)) ? ry * outH : 0
+        ctx.save()
+        ctx.translate(outW / 2 + tx, outH / 2 + ty)
+        ctx.scale(s, s)
+        ctx.drawImage(src, 0, 0, src.width, src.height, -mw / 2, -mh / 2, mw, mh)
+        ctx.restore()
+        return off.toDataURL('image/png')
+      } catch (e) {
+        return ''
+      }
+    }
+
+    /**
+     * 看板娘轮换入口：页面与引擎常驻，仅切换模型（避免整页重载的空白）。
+     * 双缓冲：先加载新模型（未初始化不绘制），旧模型画面保留；
+     * 新模型就绪后再移除旧模型，无缝切换，不显示加载提示。
+     */
+    window.__switchModel = function (newPath, newActions) {
+      stopRotation()
+      if (switchTimer !== null) {
+        clearInterval(switchTimer)
+        switchTimer = null
+      }
+      // 模型页切换不同模型时动作列表不同，随切换一并更新
+      if (typeof newActions === 'string' && newActions !== '') {
+        ACTION_NAMES = newActions.split(',').map(function (s) { return s.trim() }).filter(function (s) { return s !== '' })
+      }
+      rotateIndex = 0
+      idleBaseCount = 0
+      actionsInjected = false
+      var mgr = window.__live2dManager
+      if (!mgr || !mgr.createModel) {
+        loadlive2d('l2d-render-canvas', '/api/live2d/assets/cubism2/' + newPath)
+        startRotation()
+        return
+      }
+      // 双缓冲：新模型加入管理器并加载（未初始化不参与绘制，旧模型继续渲染）
+      var next = mgr.createModel()
+      try {
+        next.load('l2d-render-canvas', '/api/live2d/assets/cubism2/' + newPath, null)
+      } catch (e) {
+        notifyFail('模型切换失败')
+        return
+      }
+      // 轮询新模型就绪后移除旧模型
+      switchTimer = setInterval(function () {
+        var total = mgr.numModels ? mgr.numModels() : (mgr.models ? mgr.models.length : 0)
+        var latest = mgr.getModel(total - 1)
+        if (!latest || !latest.isInitialized || !latest.isInitialized()) {
+          return
+        }
+        clearInterval(switchTimer)
+        switchTimer = null
+        // 移除除新模型外的全部旧模型（引擎渲染循环会绘制所有 models）
+        var models = mgr.models || []
+        for (var i = models.length - 1; i >= 0; i--) {
+          if (models[i] !== latest) {
+            try { if (models[i].release) models[i].release(true) } catch (e) { /* 忽略 */ }
+            models.splice(i, 1)
+          }
+        }
+        startRotation()
+        setTimeout(hideMsg, 300)
+      }, 100)
+    }
+
+    // ── 宿主动作面板入口（F1-1）：手动播放指定动作 + 暂停/恢复轮播 ──
+    // 动作名为注入到 idle 组时的模型-json 路径（如 motions/happy.mtn，与数据库 actions 一致）
+    window.__playAction = function (name) {
+      if (ACTION_NAMES.length === 0 || !injectActions()) return
+      var idx = ACTION_NAMES.indexOf(name)
+      if (idx < 0) return
+      try {
+        var mgr = window.__live2dManager
+        var model = mgr && mgr.getModel ? mgr.getModel(0) : null
+        if (model) {
+          model.startMotion('idle', idleBaseCount + idx, PRIORITY_FORCE)
+          console.log('[L2D2] manualAction: ' + name)
+        }
+      } catch (e) { /* 模型未就绪等场景静默忽略 */ }
+    }
+    window.__stopRotation = function () { stopRotation() }
+    window.__startRotation = function () { startRotation() }
+
+    var script = document.createElement('script')
+    // 引擎资源已启用 immutable 长缓存，升级引擎时需同步 bump ?v= 参数（与 utils.ts ENGINE_VER 对应）
+    script.src = 'js/live2d.js?v=2'
+    script.onload = function () {
+      var loadlive2d = window.loadlive2d
+      if (!loadlive2d) {
+        notifyFail('引擎加载失败')
+        return
+      }
+      try {
+        var probe = document.createElement('canvas')
+        var gl = probe.getContext('webgl') || probe.getContext('experimental-webgl')
+        if (!gl) {
+          notifyFail('浏览器不支持 WebGL')
+          return
+        }
+        // 探测后立即释放上下文：卡片数量多时每个泄漏的探测上下文会撑爆
+        // 浏览器 WebGL 上下文上限（约 16 个），导致模型画面被“丢上下文”变空白
+        var lose = gl.getExtension('WEBGL_lose_context')
+        if (lose) lose.loseContext()
+        gl = null
+        probe = null
+        // 模型路径相对外部模型根，页面已迁到 engines/，须用绝对 URL（引擎按 json 所在目录解析纹理/动作）
+        loadlive2d('l2d-render-canvas', '/api/live2d/assets/cubism2/' + path)
+        startRotation()
+        setTimeout(hideMsg, 1500)
+      } catch (e) {
+        notifyFail('模型加载失败：' + ((e && e.message) || e))
+      }
+    }
+    script.onerror = function () {
+      notifyFail('引擎脚本加载失败')
+    }
+    document.head.appendChild(script)
+  })()
+  </script>
+</body>
+</html>

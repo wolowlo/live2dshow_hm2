@@ -1,0 +1,22 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+# macOS
+.DS_Store
+
+# 签名材料与密码密文（防泄露）
+*.p12
+*.cer
+*.p7b
+*.csr
+material/
+build-profile.json5
