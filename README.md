@@ -8,7 +8,7 @@
 - **模型管理**：从相册导入 Live2D 模型（zip 包自动解压识别），缩略图速览、收藏 / 分类 / 版本筛选、删除管理
 - **互动体验**：模型动作播放、自动轮播、沉浸模式
 - **个性定制**：三套主题（粉色蜜桃 / 蜂蜜奶油 / 青瓷）、自定义背景（纯色 / 图片 / 无）
-- **桌面直达**：支持桌面卡片，快速查看模型
+- **桌面直达**(已删除)：支持桌面卡片，快速查看模型
 - **数据安全**：全部数据（模型、缩略图、背景、收藏、偏好）仅存于设备本地沙箱；支持一键导出 / 恢复备份（zip）
 
 ## 环境要求
@@ -24,7 +24,7 @@
 
 ```bash
 # 1. 解压源码包
-unzip live2dview_hm2_source.zip -d live2dview_hm2
+unzip live2dview_hm2.zip -d live2dview_hm2
 
 # 2. 安装依赖（须在 DevEco 终端或配置好 ohpm 的环境执行）
 cd live2dview_hm2
@@ -106,13 +106,17 @@ live2dview_hm2/
 ## 常见问题
 
 **Q1：打开工程后提示缺少签名？**
-进入 `File → Project Structure → Signing Configs`，勾选自动签名生成调试证书即可（`build-profile.json5` 中的 `REPLACE_ME_*` 占位会被自动替换为本机实际签名）。
+进入 `File → Project Structure → Signing Configs`，勾选自动签名生成调试证书即可（`build-profile.json5` 中的 `REPLACE_ME_*` 占位会被自动替换为本机实际签名）,如无法生成,需要连接虚拟机或者真机。
 
 **Q2：命令行构建报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED`？**
 构建前 `unset NODE_OPTIONS`，并使用 DevEco 自带 node（见上方快速开始）。
 
 **Q3：首次运行没有模型可看？**
 内置示例模型在 `rawfile`，或通过「模型管理 → 导入」从相册导入 Live2D 模型包（zip，含 .model3.json / moc3 或 model.json / moc 的 Cubism 2/3 结构）。
+
+## 模型下载
+
+https://github.com/Eikanya/Live2d-model.git
 
 ## License
 
